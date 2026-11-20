@@ -12,11 +12,12 @@ Design contract (work order, 2026-10-24):
 - Kill switch: if KILLSWITCH exists in this directory, events are only
   logged, never drafted. Touch/rm the file to stop/resume drafting.
 """
-import collections, fcntl, hashlib, hmac, json, os, queue, re, shutil, subprocess, sys, threading, time, urllib.request
+import collections, fcntl, hashlib, hmac, json, os, queue, re, shutil, stat, subprocess, sys, threading, time, urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from draft_queue import handed_off, publish
-from you_config import absolute_path, binding, credential, sessions
+from onebot_http import read_json
+from you_config import absolute_path, binding, credential, open_trusted_directory, sessions
 
 QQ_DIR = Path(__file__).resolve().parent.parent
 BRIDGE_DIR = Path(__file__).resolve().parent
@@ -1027,7 +1028,7 @@ def _qidx_via_get_msg(mid, sess=None):
         req = urllib.request.Request("http://127.0.0.1:3000/get_msg", data=body,
             headers={"Content-Type": "application/json",
                      "Authorization": f"Bearer {TOKEN}"})
-        resp = json.loads(urllib.request.urlopen(req, timeout=5).read())
+        resp = read_json(req, timeout=5, limit=1024 * 1024)
         d = resp.get("data") or {}
         if d.get("message_id") is not None and str(d["message_id"]) != str(mid):
             return None
@@ -4686,6 +4687,71 @@ def in_scope(ev):
     return ev.get("post_type") == "message" and _ev_sess(ev) in ROUTES
 
 
+_LOG_MESSAGE_FIELDS = {
+    "text": ("text",),
+    "at": ("qq",),
+    "face": ("id",),
+    "file": ("name",),
+    "reply": ("id",),
+}
+
+
+def _event_for_disk(ev):
+    fields = ("post_type", "message_type", "self_id", "user_id",
+              "message_id", "time", "tx")
+    row = {name: ev[name] for name in fields}
+    if ev["message_type"] == "group":
+        row["group_id"] = ev["group_id"]
+    if ev["message_type"] == "private" and str(ev["user_id"]) == str(ev["self_id"]):
+        row["target_id"] = ev["target_id"]
+    row["sender"] = {name: ev["sender"][name] for name in ("card", "nickname")
+                     if name in ev["sender"]}
+    message = ev["message"]
+    if isinstance(message, list):
+        message = [
+            {"type": segment["type"], "data": {
+                name: segment["data"][name]
+                for name in _LOG_MESSAGE_FIELDS.get(segment["type"], ())
+                if name in segment["data"]
+            }}
+            for segment in message
+        ]
+    row["message"] = message
+    return row
+
+
+def _open_events_log():
+    owner = os.geteuid()
+    parent = open_trusted_directory(EVENTS_LOG.parent.parent, {0, owner})
+    try:
+        name = EVENTS_LOG.parent.name
+        try:
+            os.mkdir(name, 0o700, dir_fd=parent)
+        except FileExistsError:
+            pass
+        directory = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                            dir_fd=parent)
+        try:
+            info = os.fstat(directory)
+            if info.st_uid != owner or stat.S_IMODE(info.st_mode) != 0o700:
+                raise RuntimeError("Unsafe event log directory")
+            fd = os.open(EVENTS_LOG.name, os.O_WRONLY | os.O_APPEND | os.O_CREAT
+                         | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600, dir_fd=directory)
+        finally:
+            os.close(directory)
+    finally:
+        os.close(parent)
+    try:
+        info = os.fstat(fd)
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != owner
+                or info.st_nlink != 1 or stat.S_IMODE(info.st_mode) != 0o600):
+            raise RuntimeError("Unsafe event log file")
+        return os.fdopen(fd, "a", encoding="utf-8")
+    except BaseException:
+        os.close(fd)
+        raise
+
+
 def _persist_event(ev):
     """事件先落盘。返回 'ok' / 'dup' / 'fail'。'fail' 时绝不可回 200。
 
@@ -4702,7 +4768,7 @@ def _persist_event(ev):
     if not ev.get("tx"):
         ev["tx"] = _new_txid()   # 第 2 批：事务 ID 在落盘源头生成、随记录行走
     fp = _ev_fp(ev)
-    line = json.dumps(ev, ensure_ascii=False) + "\n"
+    line = json.dumps(_event_for_disk(ev), ensure_ascii=False) + "\n"
     err = None
     with ACK_LOCK:
         if fp in _ACK_SEEN:
@@ -4712,8 +4778,7 @@ def _persist_event(ev):
         else:
             _ACK_SEEN[fp] = time.time()      # 先占位，后写盘
             try:
-                EVENTS_LOG.parent.mkdir(mode=0o700, exist_ok=True)
-                with open(EVENTS_LOG, "a", encoding="utf-8") as f:
+                with _open_events_log() as f:
                     f.write(line)
                     f.flush()
                     os.fsync(f.fileno())
@@ -5036,6 +5101,8 @@ if __name__ == "__main__":
     API_KEY = credential("YOU_DSH_KEY")
     if WEBHOOK_SECRET == TOKEN or API_KEY in (TOKEN, WEBHOOK_SECRET):
         raise RuntimeError("Bridge credentials must be distinct")
+    with _open_events_log():
+        pass
     CONTACTS.mkdir(parents=True, exist_ok=True)
     _ack_warm()
     # R-02：启动补处理（独立线程）——扫「有 tx 的事件 − 已处理集合」，

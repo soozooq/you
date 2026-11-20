@@ -57,7 +57,8 @@ Design contract:
 """
 import fcntl, hashlib, json, os, random, re, subprocess, sys, stat, time, urllib.request
 from pathlib import Path
-from you_config import absolute_path, binding, credential, sessions
+from onebot_http import read_json
+from you_config import absolute_path, binding, credential, open_trusted_directory, sessions
 
 QQ_DIR = Path(__file__).resolve().parent.parent
 SENDER_DIR = Path(__file__).resolve().parent
@@ -368,8 +369,7 @@ def _raw_post(url, payload, timeout):
     req = urllib.request.Request(url, data=body, headers={
         "Content-Type": "application/json",
         "Authorization": f"Bearer {TOKEN}"})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.loads(r.read().decode())
+    return read_json(req, timeout=timeout, limit=64 * 1024)
 
 def _resp_ok(resp):
     """OneBot 业务成功口径，与 handle_draft 调用方的校验一致：
@@ -841,10 +841,19 @@ def pump(st):
     path = absolute_path("YOU_QUEUE_FILE")
     if path == DRAFTS_LOG or path.resolve() == DRAFTS_LOG.resolve():
         raise RuntimeError("Sender requires a separate queue")
-    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    owner = os.environ.get("YOU_QUEUE_OWNER_UID", str(os.geteuid()))
+    if not re.fullmatch(r"[0-9]{1,10}", owner) or int(owner) > 4294967294:
+        raise RuntimeError("Invalid queue owner UID")
+    owner_uid = int(owner)
+    directory = open_trusted_directory(path.parent, {0, owner_uid, os.geteuid()})
+    try:
+        fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+    finally:
+        os.close(directory)
     with os.fdopen(fd, "rb") as stream:
         info = os.fstat(stream.fileno())
-        if not stat.S_ISREG(info.st_mode) or not info.st_ino or info.st_mode & 0o027:
+        if (not stat.S_ISREG(info.st_mode) or not info.st_ino or info.st_nlink != 1
+                or info.st_uid != owner_uid or info.st_mode & 0o027):
             raise RuntimeError("Unsafe queue file")
         identity = [generation, info.st_dev, info.st_ino]
         if "queue_identity" not in st and os.environ.get("YOU_QUEUE_INITIALIZE") == generation:

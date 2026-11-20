@@ -74,3 +74,24 @@ def binding(name, prefix, routes):
     if key is not None and (key not in routes or not key.startswith(prefix)):
         raise RuntimeError(f"Invalid session binding for {name}")
     return key
+
+
+def open_trusted_directory(path, owners):
+    """Open an absolute directory without following links or writable ancestors."""
+    path = Path(path)
+    if not path.is_absolute() or ".." in path.parts:
+        raise RuntimeError("Unsafe state directory path")
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    fd = os.open("/", flags)
+    try:
+        for part in path.parts[1:]:
+            child = os.open(part, flags, dir_fd=fd)
+            os.close(fd)
+            fd = child
+            info = os.fstat(fd)
+            if info.st_uid not in owners or info.st_mode & 0o022:
+                raise RuntimeError("Unsafe state directory")
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise

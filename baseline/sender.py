@@ -55,8 +55,9 @@ Design contract:
 - Tailing offset persists in state.json across restarts: drafts written
   while the sender was down are never sent retroactively.
 """
-import hashlib, json, os, random, re, subprocess, sys, time, urllib.request
+import fcntl, hashlib, json, os, random, re, subprocess, sys, stat, time, urllib.request
 from pathlib import Path
+from you_config import absolute_path, binding, credential, sessions
 
 QQ_DIR = Path(__file__).resolve().parent.parent
 SENDER_DIR = Path(__file__).resolve().parent
@@ -68,6 +69,7 @@ DRAFTS_LOG = QQ_DIR / "drafts.jsonl"
 # claim is content-independent - draft text plays no part in it.
 DUP_CLAIMS_DIR = QQ_DIR / "sender" / "dup-claims"
 SENDS_LOG = QQ_DIR / "sends.jsonl"
+SEND_HISTORY = QQ_DIR / "private-state" / "sends.jsonl"
 ALERT_LOG = QQ_DIR / "sends-alerts.jsonl"  # 与 sends.jsonl 同目录的告警账
 UNKNOWN_LOG = QQ_DIR / "sends-unknown.jsonl"  # R-03：POST 结果未知的单独账
 STATE_FILE = SENDER_DIR / "state.json"
@@ -80,13 +82,12 @@ try:
     from rubber import apply_rubber
 except Exception:
     apply_rubber = None
-TOKEN = (QQ_DIR / "onebot-token.txt").read_text().strip()
+TOKEN = None
 API_BASE = "http://127.0.0.1:3000"
-ROUTES = {
-    "grp-81658512": ("group", 81658512),        # 秋秋祈祷室～直播家人群
-    "dm-1480760876": ("private", 1480760876),   # 草莓奶昔（用户大号）
-    "dm-1689332102": ("private", 1689332102),   # 仲宥
-}
+ROUTES = sessions()
+MASTER_DM = binding("YOU_MASTER_DM", "dm-", ROUTES)
+STICKER_GROUP = binding("YOU_STICKER_GROUP", "grp-", ROUTES)
+TTS_PYTHON = absolute_path("YOU_TTS_PYTHON", sys.executable)
 BRAKE_PER_HOUR = 100  # runaway circuit breaker only - NOT pacing; counts SEGMENTS
 PROACTIVE_MIN_INTERVAL = 3600
 PROACTIVE_MAX_PER_DAY = 6
@@ -140,37 +141,32 @@ TTS_ENGINE_FILE = QQ_DIR / "voice-out" / "tts-engine"
 TTS_TIMEOUT = 90
 
 def _run_tts(script, text):
-    """Run one TTS engine script (same interpreter, subprocess-isolated);
-    returns the wav Path it printed, or None."""
+    """Adapter stdin contract for deployment verification."""
     try:
-        p = subprocess.run([sys.executable, str(script), text],
-                           capture_output=True, text=True, timeout=TTS_TIMEOUT)
-        if p.returncode == 0:
-            lines = (p.stdout or "").strip().splitlines()
-            if lines:
-                path = Path(lines[-1].strip())
-                if path.exists() and path.stat().st_size > 1000:
-                    return path
-    except Exception:
+        result = subprocess.run(
+            [str(TTS_PYTHON), str(script)], input=text, encoding="utf-8",
+            capture_output=True, timeout=TTS_TIMEOUT,
+            env={"HOME": str(Path.home()), "LANG": "C.UTF-8"},
+        )
+        lines = result.stdout.splitlines()
+        if result.returncode or len(lines) != 1:
+            return None
+        root = (QQ_DIR / "voice-out").resolve()
+        path = Path(lines[0])
+        if not path.is_absolute() or path.is_symlink():
+            return None
+        path = path.resolve(strict=True)
+        if root in path.parents and path.is_file() and 1000 < path.stat().st_size <= 20 * 1024 * 1024:
+            return path
+    except (OSError, UnicodeError, subprocess.SubprocessError):
         pass
     return None
 
-def _eleven_enabled():
-    try:
-        return TTS_ENGINE_FILE.read_text(
-            encoding="utf-8").strip().lower() != "mimo"
-    except Exception:
-        return True
 
 def synth_voice(text):
-    """Synthesize `text` to a wav: ElevenLabs Xiaoxi clone first
-    (2026-10-28), MiMo VoiceDesign as automatic fallback.
-    Returns a Path or None."""
-    if _eleven_enabled():
-        got = _run_tts(TTS_ELEVEN, text)
-        if got is not None:
-            return got
-    return _run_tts(TTS_MIMO, text)
+    # Keep both external adapters disabled pending contract and policy validation.
+    return None
+
 
 # Anthem gag (user rule, 2026-10-26): the bridge emits draft_text
 # "[anthem]" when someone asks her to sing the national anthem. Expand
@@ -209,6 +205,11 @@ def _atomic_write(path, text):
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp, path)
+    fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
 
 def _preserve_corrupt_state(err):
     """B-02 残余加固（GPT 复审 2026-10-27）：state.json 读取/解析失败时，
@@ -241,7 +242,7 @@ def load_state():
         try:
             st = json.loads(STATE_FILE.read_text())
             if "sent" not in st:
-                st["sent"] = {"grp-81658512": st.pop("sent_ts", [])}
+                st["sent"] = {STICKER_GROUP: st.pop("sent_ts", [])} if STICKER_GROUP else {}
             st.setdefault("proactive_ts", [])
             st.setdefault("proactive_dm_ts", [])
             return st
@@ -302,9 +303,14 @@ def reconcile_inflight():
 
 def log_rec(rec):
     rec = {"ts": time.time(), **rec}
-    with open(SENDS_LOG, "a") as f:
-        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-    print(json.dumps(rec, ensure_ascii=False), flush=True)
+    SEND_HISTORY.parent.mkdir(mode=0o700, exist_ok=True)
+    with open(SEND_HISTORY, "a", encoding="utf-8") as stream:
+        history = {key: value for key, value in rec.items() if key not in ("incoming", "draft_orig")}
+        stream.write(json.dumps(history, ensure_ascii=False) + "\n")
+    audit = {key: rec[key] for key in ("ts", "tx", "result", "draft_id") if key in rec}
+    with open(SENDS_LOG, "a", encoding="utf-8") as stream:
+        stream.write(json.dumps(audit, ensure_ascii=False) + "\n")
+    print(json.dumps({"result": rec.get("result"), "ts": rec["ts"]}), flush=True)
 
 # ---- 发送归属（2026-10-27 审计 A04） ---------------------------------
 # sends 记录的 origin：这一稿到底是谁产的。sends 有账只证明「经
@@ -585,7 +591,7 @@ def check_candidate(key, kind, d, st):
                 return False, "proactive:min_interval", None, {}, ""
             if len(hist) >= PROACTIVE_MAX_PER_DAY:
                 return False, "proactive:day", None, {}, ""
-        elif key == "dm-1480760876":
+        elif key == MASTER_DM:
             # Proactive DM to the master (2026-10-26, opt-in feature):
             # the proactive_dm daemon gates on the ENABLED flag and idle
             # time before drafting; re-check the flag here so switching
@@ -613,7 +619,7 @@ def _sent_history(key, now):
     recent, day = [], []
     try:
         rows = []
-        for line in open(SENDS_LOG, encoding="utf-8"):
+        for line in open(SEND_HISTORY, encoding="utf-8"):
             try:
                 r = json.loads(line)
             except Exception:
@@ -648,13 +654,18 @@ def handle_draft(draft_id, d, route, st):
             _fd = os.open(DUP_CLAIMS_DIR / str(_bp),
                           os.O_CREAT | os.O_EXCL | os.O_WRONLY)
             os.close(_fd)
+            directory = os.open(DUP_CLAIMS_DIR, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
         except FileExistsError:
             log_rec({**base, "result": "DUP_BLOCKED",
                      "reason": "batch_primary already claimed"})
             return
-        except Exception:
-            pass
-    summary = re.sub(r"\s+", " ", (d.get("draft_text") or "")).strip()
+        except OSError:
+            raise
+    summary = "send started"
     inflight_mark(draft_id, summary)
     segments = 0
     part_ids = []   # 全部段的 message_id（D-01 根治）；提前初始化，异常路径也要能落账
@@ -747,7 +758,7 @@ def handle_draft(draft_id, d, route, st):
                 time.sleep(max(0.8, min(0.7 + 0.045 * nxt, 3.2)) * random.uniform(0.8, 1.2))
         now = time.time()
         if d.get("proactive"):
-            if d["key"] == "dm-1480760876":
+            if d["key"] == MASTER_DM:
                 st.setdefault("proactive_dm_ts", []).append(now)
             else:
                 st.setdefault("proactive_ts", []).append(now)
@@ -791,45 +802,97 @@ def handle_draft(draft_id, d, route, st):
         inflight_done(draft_id)
 
 
+def queue_record(raw):
+    try:
+        draft = json.loads(raw.decode("utf-8"))
+    except (ValueError, RecursionError):
+        return None
+    if not isinstance(draft, dict):
+        return None
+    key = draft.get("key")
+    text = draft.get("draft_text")
+    reply = draft.get("reply_to")
+    transactions = draft.get("tx")
+    if isinstance(transactions, str):
+        transactions = [transactions]
+    if (type(draft.get("version")) is not int or draft["version"] != 1
+            or not isinstance(key, str) or key not in ROUTES
+            or draft.get("decision") != "REPLY"
+            or not isinstance(text, str) or not text.strip() or len(text) > 8192
+            or any(type(draft[name]) is not bool for name in ("quote", "proactive") if name in draft)
+            or (reply is not None and (type(reply) not in (str, int)
+                                       or not re.fullmatch(r"-?[0-9]{1,20}", str(reply))))
+            or any(not isinstance(draft.get(name), str)
+                   or not re.fullmatch(r"[0-9a-f]{64}", draft[name])
+                   for name in ("batch_primary", "record_id"))
+            or (transactions is not None and (not isinstance(transactions, list)
+                or len(transactions) > 256 or any(not isinstance(tx, str) or len(tx) > 128
+                                                  for tx in transactions)))):
+        return None
+    return draft
+
+
 def pump(st):
-    """One pass over the drafts log. Returns candidate count handled.
-    Only complete lines are consumed; the offset moves one line at a time,
-    after that line reached a terminal outcome."""
-    if not DRAFTS_LOG.exists():
+    """Consume up to 256 complete records and 1 MiB per poll."""
+    configured = os.environ.get("YOU_QUEUE_FILE")
+    generation = os.environ.get("YOU_QUEUE_GENERATION")
+    if not configured or not generation:
         return 0
-    size = DRAFTS_LOG.stat().st_size
-    if size < st["offset"]:
-        st["offset"] = 0
-        save_state(st)
-    if size == st["offset"]:
-        return 0
-    with open(DRAFTS_LOG, "rb") as f:
-        f.seek(st["offset"])
-        chunk = f.read()
-    pos = st["offset"]
-    handled = 0
-    for raw_line in chunk.split(b"\n")[:-1]:
-        end = pos + len(raw_line) + 1
-        try:
-            d = json.loads(raw_line.decode("utf-8", "ignore"))
-        except Exception:
-            d = None
-        route = ROUTES.get(d.get("key")) if d else None
-        if route and d.get("decision") == "REPLY":
-            did = "d%d-%s" % (pos, hashlib.sha1(raw_line).hexdigest()[:10])
-            handle_draft(did, d, route, st)
-            handled += 1
-        st["offset"] = end
-        save_state(st)
-        pos = end
-    return handled
+    path = absolute_path("YOU_QUEUE_FILE")
+    if path == DRAFTS_LOG or path.resolve() == DRAFTS_LOG.resolve():
+        raise RuntimeError("Sender requires a separate queue")
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, "rb") as stream:
+        info = os.fstat(stream.fileno())
+        if not stat.S_ISREG(info.st_mode) or not info.st_ino or info.st_mode & 0o027:
+            raise RuntimeError("Unsafe queue file")
+        identity = [generation, info.st_dev, info.st_ino]
+        if "queue_identity" not in st and os.environ.get("YOU_QUEUE_INITIALIZE") == generation:
+            st.update(queue_identity=identity, offset=0, skipping=False)
+            save_state(st)
+        if st.get("queue_identity") != identity or not 0 <= st["offset"] <= info.st_size:
+            raise RuntimeError("Queue generation or cursor mismatch")
+        stream.seek(st["offset"])
+        handled = 0
+        remaining = 1024 * 1024
+        for _ in range(256):
+            if remaining == 0:
+                break
+            limit = min(65536, remaining)
+            raw = stream.readline(limit)
+            if not raw:
+                break
+            remaining -= len(raw)
+            if not raw.endswith(b"\n"):
+                if not st.get("skipping") and len(raw) < 65536:
+                    break
+                st.update(offset=stream.tell(), skipping=True)
+                save_state(st)
+                continue
+            draft = None if st.get("skipping") else queue_record(raw)
+            if draft is None:
+                print(json.dumps({"result": "QUEUE_REJECTED", "offset": st["offset"],
+                                  "reason": "oversize" if st.get("skipping") else "schema"}),
+                      flush=True)
+            else:
+                os.fsync(stream.fileno())
+                handle_draft(draft["record_id"], draft, ROUTES[draft["key"]], st)
+                handled += 1
+            st.update(offset=stream.tell(), skipping=False)
+            save_state(st)
+        return handled
 
 
 def main():
+    global TOKEN
+    os.umask(0o077)
+    TOKEN = credential("YOU_ONEBOT_TOKEN")
+    lock = open(STATE_FILE.with_suffix(".lock"), "a", encoding="utf-8")
+    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     st = load_state()
     save_state(st)
     left = reconcile_inflight()
-    print(f"sender up: routes={list(ROUTES)} "
+    print(f"sender up: routes={len(ROUTES)} "
           f"gate={'ON' if gate_on() else 'OFF'} "
           f"tail_offset={st['offset']} inflight_lost={left}", flush=True)
     while True:
@@ -837,7 +900,7 @@ def main():
             pump(st)
             time.sleep(2)
         except Exception as e:
-            print(f"sender loop error: {e}", flush=True)
+            print(f"sender loop error: {type(e).__name__}", flush=True)
             time.sleep(3)
 
 if __name__ == "__main__":

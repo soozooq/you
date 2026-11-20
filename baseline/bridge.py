@@ -12,16 +12,18 @@ Design contract (work order, 2026-10-24):
 - Kill switch: if KILLSWITCH exists in this directory, events are only
   logged, never drafted. Touch/rm the file to stop/resume drafting.
 """
-import collections, fcntl, hashlib, json, os, re, shutil, subprocess, sys, threading, time, urllib.request
+import collections, fcntl, hashlib, hmac, json, os, queue, re, shutil, subprocess, sys, threading, time, urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from draft_queue import handed_off, publish
+from you_config import absolute_path, binding, credential, sessions
 
 QQ_DIR = Path(__file__).resolve().parent.parent
 BRIDGE_DIR = Path(__file__).resolve().parent
 CONTACTS = QQ_DIR / "contacts"
-EVENTS_LOG = QQ_DIR / "events.jsonl"
+EVENTS_LOG = QQ_DIR / "private-state" / "events.jsonl"
 DRAFTS_LOG = QQ_DIR / "drafts.jsonl"
-SENDS_LOG = QQ_DIR / "sends.jsonl"
+SENDS_LOG = QQ_DIR / "private-state" / "sends.jsonl"
 LEDGER = QQ_DIR / "memory-ledger.jsonl"
 # 接话闸影子日志（7b, 2026-10-27）：每批一条，含每信号分/总分/阈值/骰子/
 # 闸门判定/实际结果。只记不拦——这条日志是标定材料，不是上线判据。
@@ -33,9 +35,13 @@ DECISIONS_LOG = QQ_DIR / "decisions.jsonl"
 USAGE_LEDGER = QQ_DIR / "usage-ledger.jsonl"
 KILLSWITCH = BRIDGE_DIR / "KILLSWITCH"
 DSH_HOME = Path.home() / "workspace/xiaomei-dsh/dsh-home"
-VENV_PY = Path.home() / "workspace/xiaomei-dsh/.venv/bin/python"
+VENV_PY = absolute_path("YOU_PYTHON", sys.executable)
 AGENTS_SRC = Path.home() / "workspace/xiaomei-dsh/xiaomei-workspace/AGENTS.md"
-TOKEN = (QQ_DIR / "onebot-token.txt").read_text().strip()
+TOKEN = None
+WEBHOOK_SECRET = None
+ROUTES = sessions()
+MASTER_DM = binding("YOU_MASTER_DM", "dm-", ROUTES)
+STICKER_GROUP = binding("YOU_STICKER_GROUP", "grp-", ROUTES)
 SELF_ID = None  # learned from events (self_id field)
 
 # Drives state layer (2026-10-26): four slowly-drifting inner-state
@@ -178,11 +184,7 @@ except Exception as _ug_err:
     _gate_health("gate_module_missing",
                  fault_class="GATE_MODULE_MISSING", error=repr(_ug_err))
 
-def load_api_key():
-    import yaml
-    creds = yaml.safe_load((DSH_HOME / ".credentials.yaml").read_text())
-    return creds["refs"]["DEEPSEEK_API_KEY"]
-API_KEY = load_api_key()
+API_KEY = None
 
 _locks = {}
 _locks_guard = threading.Lock()
@@ -495,7 +497,7 @@ def hot_topics_note(key):
     a retelling accident. Mention-only: she may bring a topic up when
     the conversation genuinely touches it; nothing here ever sends by
     itself. Silent no-op on any problem, like every injection here."""
-    if key != "grp-81658512":
+    if key != STICKER_GROUP:
         return ""
     try:
         days = (json.loads(HOT_TOPICS_FILE.read_text()).get("days") or [])
@@ -605,36 +607,6 @@ def peer_note(key, scene, uids=None, called=False):
         return ""
 
 
-def _fetch_sticker(fname, out):
-    """Copy a received image into candidates/ through the shared
-    resolver (NapCat-era docstring said 'local cache'; SnowLuma's
-    get_image returns a URL, which the resolver downloads first -
-    the collector silently froze at the migration until this fix)."""
-    try:
-        if len(list(CANDIDATES_DIR.iterdir())) > 300:
-            return
-        local = _resolve_image_path(fname)
-        if local is not None and Path(local).exists():
-            shutil.copyfile(local, out)
-    except Exception:
-        pass
-
-def collect_stickers(ev):
-    """MaiBot-style sticker collecting: save image segments from the
-    prayer-room group into candidates/ for later human curation. Only
-    curated stickers (manifest.json) can ever be sent."""
-    for seg in ev.get("message") or []:
-        if seg.get("type") != "image":
-            continue
-        d = seg.get("data") or {}
-        fname = d.get("file")
-        if not fname:
-            continue
-        out = CANDIDATES_DIR / Path(fname).name
-        if out.exists():
-            continue
-        threading.Thread(target=_fetch_sticker, args=(fname, out), daemon=True).start()
-
 def recent_group_note():
     """DM sessions get a glimpse of Xiaomei's own recent GROUP posts, so
     she does not act as if the group does not exist. Only her own public
@@ -647,7 +619,7 @@ def recent_group_note():
                 r = json.loads(raw)
             except Exception:
                 continue
-            if r.get("key") == "grp-81658512" and r.get("result") == "SENT":
+            if r.get("key") == STICKER_GROUP and r.get("result") == "SENT":
                 t = time.strftime("%H:%M", time.localtime(r["ts"]))
                 _prov_note_send(r)
                 observed = []
@@ -669,310 +641,15 @@ FACE_NAMES = {4: "得意", 5: "流泪", 6: "害羞", 8: "困", 9: "大哭",
               10: "尴尬", 11: "发怒", 12: "调皮", 13: "呲牙", 14: "微笑",
               20: "偷笑", 21: "可爱", 28: "憨笑", 31: "疑问"}
 
-try:
-    from PIL import Image as _PILImage
-except Exception:
-    _PILImage = None
-
-def _ahash(path):
-    """8x8 average perceptual hash of an image file, or None."""
-    if _PILImage is None:
-        return None
-    try:
-        im = _PILImage.open(path).convert("L").resize((8, 8))
-        px = list(im.getdata())
-        avg = sum(px) / len(px)
-        bits = 0
-        for i, p in enumerate(px):
-            if p > avg:
-                bits |= 1 << i
-        return bits
-    except Exception:
-        return None
-
-_lib_hashes = {"mtime": None, "items": []}
-
-def _library_hashes():
-    try:
-        mt = MANIFEST_FILE.stat().st_mtime
-    except Exception:
-        return []
-    if _lib_hashes["mtime"] != mt:
-        items = []
-        try:
-            man = json.loads(MANIFEST_FILE.read_text()).get("stickers") or {}
-            for slug, meta in man.items():
-                h = _ahash(LIBRARY_DIR / (meta.get("file") or ""))
-                if h is not None:
-                    items.append((slug, meta.get("desc", ""), h))
-        except Exception:
-            pass
-        _lib_hashes.update(mtime=mt, items=items)
-    return _lib_hashes["items"]
-
-IMG_IN_DIR = QQ_DIR / "img-in"
-
-def _download_image(url, fname):
-    """Download an image URL into qq/img-in/ (small on-disk cache keyed
-    by the QQ file name; entries older than a day are pruned on the
-    way in). Returns the local Path or None."""
-    try:
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=15) as r:
-            data = r.read(12 * 1024 * 1024 + 1)
-        if not data or len(data) > 12 * 1024 * 1024:
-            return None
-        IMG_IN_DIR.mkdir(parents=True, exist_ok=True)
-        out = IMG_IN_DIR / (Path(fname or "img").name or "img")
-        if not out.exists() or out.stat().st_size != len(data):
-            out.write_bytes(data)
-        now = time.time()
-        for old in IMG_IN_DIR.iterdir():
-            try:
-                if now - old.stat().st_mtime > 86400:
-                    old.unlink()
-            except Exception:
-                pass
-        return out
-    except Exception:
-        return None
-
-def _resolve_image_path(fname):
-    """Ask OneBot for a received image and return a local path (sync).
-
-    SnowLuma era (repair, 2026-10-26): get_image answers with an https
-    download URL in data.file where NapCat returned a local path, so
-    the NapCat-era version of this function silently resolved nothing
-    after the migration and ALL image recognition (sticker match, OCR,
-    candidate collecting) was dead. A genuine local path is still
-    honoured first; a URL is downloaded via _download_image - the same
-    repair shape as _resolve_record_path for voice."""
-    try:
-        body = json.dumps({"file": fname}).encode()
-        req = urllib.request.Request("http://127.0.0.1:3000/get_image", data=body,
-            headers={"Content-Type": "application/json",
-                     "Authorization": f"Bearer {TOKEN}"})
-        resp = json.loads(urllib.request.urlopen(req, timeout=8).read())
-        d = resp.get("data") or {}
-        f = d.get("file")
-        if f and not str(f).startswith("http") and Path(f).exists():
-            return Path(f)
-        url = f if f and str(f).startswith("http") else d.get("url")
-        if url and str(url).startswith("http"):
-            return _download_image(str(url), fname)
-    except Exception:
-        pass
-    return None
-
-def _resolve_image(seg_data):
-    """Local path for an image segment: SnowLuma puts a download URL
-    right on the segment - take it first, else the get_image route."""
-    seg_data = seg_data or {}
-    url = seg_data.get("url")
-    fname = seg_data.get("file")
-    if url and str(url).startswith("http"):
-        p = _download_image(str(url), fname)
-        if p is not None:
-            return p
-    if fname:
-        return _resolve_image_path(fname)
-    return None
-
-try:
-    import vision as _vision
-except Exception:
-    _vision = None
-
 def recognize_images(ev, text):
-    """Let her 'see' images: when an incoming image matches a curated
-    library sticker (perceptual hash), the [图片] placeholder is
-    replaced by that sticker's description; other images go through
-    vision.py - cloud semantic caption first, local OCR/VLM second -
-    and stay [图片] only when every route fails."""
-    if "[图片]" not in text:
-        return text
-    segs = [s for s in ev.get("message") or [] if s.get("type") == "image"]
-    if not segs:
-        return text
-    lib = _library_hashes()
-    if not lib:
-        return text
-    for seg in segs:
-        fname = (seg.get("data") or {}).get("file")
-        if not fname:
-            continue
-        local = _resolve_image(seg.get("data") or {})
-        if local is None:
-            continue
-        h = _ahash(local)
-        if h is None:
-            continue
-        slug, desc, bh = min(lib, key=lambda it: bin(h ^ it[2]).count("1"))
-        if bin(h ^ bh).count("1") <= 6:
-            text = text.replace("[图片]", f"[表情包:{desc}]", 1)
-    # Fallback (DSH vision-quest, reviewed & integrated 2026-10-24): images
-    # the library does not know go through vision.py. At most one per
-    # message to bound latency; failures keep the [图片] placeholder.
-    # Semantic sidecar first (2026-10-26): a cloud vision model returns
-    # one Chinese sentence (content + emotion + key text, OCR-merged,
-    # hash-cached) so text-less photos are no longer invisible to her;
-    # any failure falls through to the local OCR/VLM caption.
-    if "[图片]" in text and _vision is not None:
-        for seg in segs:
-            fname = (seg.get("data") or {}).get("file")
-            if not fname:
-                continue
-            local = _resolve_image(seg.get("data") or {})
-            if local is None:
-                continue
-            cap = None
-            try:
-                cap = _vision.semantic_caption(local)
-            except Exception:
-                cap = None
-            if not cap:
-                try:
-                    cap = _vision.caption_image(local)
-                except Exception:
-                    cap = None
-            if cap:
-                text = text.replace("[图片]", f"[图片内容:{cap}]", 1)
-                break
+    # Media remains a placeholder until a restricted worker is deployed.
     return text
 
-VOICE_IN_DIR = QQ_DIR / "voice-in"
-# Roots under which the QQ client caches received voice files
-# (.../nt_qq_<hash>/nt_data/Ptt/<month>/Ori/<file>.amr). The hash dir and
-# month vary, so resolution globs. SnowLuma stack first, legacy second.
-_PTT_ROOTS = (
-    Path("/root/workspace/snowluma-stack/qq-home/.config/QQ"),
-    Path("/root/workspace/xiaomei-dsh/qq/home/.config/QQ"),
-)
-
-def _is_silk(path):
-    """Received QQ voice files are SILK_V3 whatever their extension says;
-    ffmpeg has no SILK decoder, so they must be detected by magic."""
-    try:
-        with open(path, "rb") as f:
-            return b"#!SILK_V3" in f.read(16)
-    except Exception:
-        return False
-
-def _silk_to_wav(src):
-    """Decode a SILK_V3 voice file to a temp WAV in qq/voice-in/ (pilk).
-    Returns the WAV path (caller deletes it) or None."""
-    try:
-        import pilk
-        VOICE_IN_DIR.mkdir(parents=True, exist_ok=True)
-        out = VOICE_IN_DIR / f"silk-{int(time.time() * 1000)}.wav"
-        pilk.silk_to_wav(str(src), str(out))
-        if out.exists() and out.stat().st_size > 44:
-            return out
-    except Exception:
-        pass
-    return None
-
-def _download_voice(url, fname):
-    """Download a voice file URL into qq/voice-in/ (temp; caller deletes)."""
-    try:
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=15) as r:
-            data = r.read(20 * 1024 * 1024 + 1)
-        if not data or len(data) > 20 * 1024 * 1024:
-            return None
-        VOICE_IN_DIR.mkdir(parents=True, exist_ok=True)
-        ext = Path(fname or "").suffix or ".amr"
-        out = VOICE_IN_DIR / f"dl-{int(time.time() * 1000)}{ext}"
-        out.write_bytes(data)
-        return out
-    except Exception:
-        return None
-
-def _resolve_record_path(seg_data):
-    """Locate a received voice message as a local file (sync).
-
-    Multi-level fallback (SnowLuma era, 2026-10-26): SnowLuma's
-    get_record returns a https download URL in data.file where NapCat
-    returned a local path, so (1) a path field on the event segment
-    itself, (2) the QQ client's own Ptt cache on disk, (3) download via
-    get_record's URL (or the segment's own url). Returns
-    (path, is_temp); (None, False) when every level fails."""
-    seg_data = seg_data or {}
-    fname = seg_data.get("file")
-    p = seg_data.get("path")
-    if p and Path(p).exists():
-        return Path(p), False
-    if fname:
-        base = Path(fname).name
-        for root in _PTT_ROOTS:
-            try:
-                for hit in root.glob(f"nt_qq_*/nt_data/Ptt/**/Ori/{base}"):
-                    if hit.is_file():
-                        return hit, False
-            except Exception:
-                continue
-    url = None
-    if fname:
-        try:
-            body = json.dumps({"file": fname, "out_format": "mp3"}).encode()
-            req = urllib.request.Request("http://127.0.0.1:3000/get_record", data=body,
-                headers={"Content-Type": "application/json",
-                         "Authorization": f"Bearer {TOKEN}"})
-            resp = json.loads(urllib.request.urlopen(req, timeout=10).read())
-            d = resp.get("data") or {}
-            f2 = d.get("file")
-            if f2 and not str(f2).startswith("http") and Path(f2).exists():
-                return Path(f2), False
-            url = f2 if f2 and str(f2).startswith("http") else d.get("url")
-        except Exception:
-            pass
-    if not url:
-        url = seg_data.get("url")
-    if url and str(url).startswith("http"):
-        dl = _download_voice(str(url), fname)
-        if dl is not None:
-            return dl, True
-    return None, False
 
 def recognize_audio(ev, text):
-    """Transcribe the first voice message in an event (local faster-whisper
-    via vision.py) and replace the [语音消息] placeholder with its text.
-    SILK files are decoded to WAV first (ffmpeg cannot read SILK); the
-    QQ client's own cache files are never deleted, only our temp files."""
-    if "[语音消息]" not in text or _vision is None:
-        return text
-    for seg in ev.get("message") or []:
-        if seg.get("type") != "record":
-            continue
-        data = seg.get("data") or {}
-        if not data.get("file"):
-            continue
-        local, is_temp = _resolve_record_path(data)
-        if local is None:
-            continue
-        wav = None
-        try:
-            src = local
-            if _is_silk(local):
-                wav = _silk_to_wav(local)
-                if wav is None:
-                    return text
-                src = wav
-            try:
-                txt = _vision.transcribe_audio(src)
-            except Exception:
-                txt = None
-            if txt:
-                return text.replace("[语音消息]", f"[语音:{txt}]", 1)
-            return text
-        finally:
-            for tmp in (wav, local if is_temp else None):
-                if tmp is not None:
-                    try:
-                        Path(tmp).unlink(missing_ok=True)
-                    except Exception:
-                        pass
+    # Unverified transcription and SILK decoding are disabled.
     return text
+
 
 def seg_text(message):
     if isinstance(message, str):
@@ -1473,13 +1150,14 @@ def cache_prefix_block():
         parts.append(memes)
     return "\n\n".join(parts)
 
-DSH_BIN = Path.home() / "workspace/xiaomei-dsh/dsh-runtime/node_modules/@deepseek-ai/dsh/lib/bin.js"
+DSH_BIN = absolute_path("YOU_DSH_BIN", str(BRIDGE_DIR / "dsh-runtime/node_modules/@deepseek-ai/dsh/lib/bin.js"))
+NODE = absolute_path("YOU_NODE", "/opt/you/node-24.22.3/bin/node")
 
 def _dsh_once(ws, env, prompt, session_id):
     # Invoke the fixed local DSH install directly. The previous npx route
     # re-resolved/downloaded the package on every call (minutes each, and
     # cache-lock contention under parallel group traffic caused timeouts).
-    cmd = ["node", str(DSH_BIN), "--profile", "qq", "--json"]
+    cmd = [str(NODE), str(DSH_BIN), "--profile", "qq", "--json"]
     if session_id:
         cmd += ["--session-id", session_id]
     cmd += ["-"]
@@ -2522,28 +2200,8 @@ def _fc_pick(query, results):
 
 def factcheck_note(key, text):
     """'（刚查到的：…）' injection for run_draft, or '' (silent no-op)."""
-    if not needs_factcheck(text):
-        return ""
-    _FACTCHECK_STATS["triggered"] += 1
-    query = _fc_query(text)
-    if not query:
-        return ""
-    try:
-        results = _bing_search(query)
-    except Exception:
-        results = []
-    _FACTCHECK_STATS["searched"] += 1
-    picked = _fc_pick(query, results)
-    if not picked:
-        try:
-            picked = _fc_pick(query, _sogou_search(query))
-        except Exception:
-            picked = []
-    if not picked:
-        return ""
-    _FACTCHECK_STATS["injected"] += 1
-    return ("\n\n（刚查到的，仅供参考、可能不准；没查到的事就老实说不知道，别装懂）\n"
-            + "\n".join(picked))
+    # Text-derived queries remain disabled pending an approved content policy.
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -2856,6 +2514,12 @@ def _clamp_warm(text):
 
 def run_draft(key, scene, peer, text, exclude_ids=None, must_answer=False, bg_text="",
               uids=None, gate_ctx=None):
+    # Model egress stays disabled pending endpoint and prompt-policy validation.
+    return {"decision": "NO_REPLY", "draft_text": ""}
+
+
+def _run_draft_after_egress_approval(key, scene, peer, text, exclude_ids=None,
+                                     must_answer=False, bg_text="", uids=None, gate_ctx=None):
     home, ws = ensure_contact(key)
     prompt = PROMPT_TMPL.format(scene=scene, peer=peer, text=text)
     # 第 2 批（2-2 / Q-01 后续）：分段长度指标——只量长度、绝不改装配。
@@ -3111,11 +2775,8 @@ def run_draft(key, scene, peer, text, exclude_ids=None, must_answer=False, bg_te
         except Exception:
             run_draft._prefix_len = None
     _segs["prefix"] = run_draft._prefix_len
-    env = dict(os.environ)
-    env["DSH_HOME"] = str(DSH_HOME)
-    env["HOME"] = str(home)
-    env["DEEPSEEK_API_KEY"] = API_KEY
-    env["npm_config_cache"] = str(SHARED_NPM_CACHE)
+    env = {"DSH_HOME": str(DSH_HOME), "HOME": str(home),
+           "DEEPSEEK_API_KEY": API_KEY, "LANG": "C.UTF-8"}
     sid_file = CONTACTS / key / "session-id.txt"
     sid = sid_file.read_text().strip() if sid_file.exists() else None
     usage = None
@@ -3285,7 +2946,7 @@ def run_draft(key, scene, peer, text, exclude_ids=None, must_answer=False, bg_te
 
 # ---------------------------------------------------------------------------
 # Persona switching by the user himself, inside QQ (user, 2026-10-25).
-# Only the master's own DM (key dm-1480760876, derived from his QQ id)
+# Only the master's own DM
 # can switch; group chat and other DMs fall through to normal drafting.
 # The switch itself is delegated to personas/switch_persona.py so the
 # QQ-side path and the Muse-side path can never drift apart.
@@ -3326,8 +2987,9 @@ def try_persona_command(text):
     tname = PERSONA_NAMES[target]
     if target == cur:
         return {"decision": "REPLY", "draft_text": f"现在就是{tname}了。"}
-    p = subprocess.run([sys.executable, str(PERSONAS_DIR / "switch_persona.py"), target],
-                       capture_output=True, text=True, timeout=60)
+    p = subprocess.run([str(VENV_PY), str(PERSONAS_DIR / "switch_persona.py"), target],
+                       capture_output=True, text=True, timeout=60,
+                       env={"HOME": str(Path.home()), "LANG": "C.UTF-8"})
     if p.returncode != 0 or _active_persona() != target:
         return {"decision": "REPLY", "draft_text": "切换没成功，你再跟我说一声。"}
     return {"decision": "REPLY", "draft_text": f"好，切到{tname}了。"}
@@ -4086,7 +3748,7 @@ def _poll_her_sends():
             except Exception: continue
             _qidx_index_send(r)
             _ridx_index_send(r)
-            if r.get("key") == "grp-81658512" and r.get("result") == "SENT":
+            if r.get("key") == STICKER_GROUP and r.get("result") == "SENT":
                 _grp["send_ts"].append(r["ts"])
                 if r.get("message_id"): _grp["msg_ids"].add(r["message_id"])
                 _grp["since_send"] = 0
@@ -4098,7 +3760,7 @@ def _poll_her_sends():
 def _retreat_intake(key, ev, text, called):
     """Group only: track engagement with her recent sends; enter retreat
     when she is told off, or when she talks a lot and nobody engages."""
-    if key != "grp-81658512":
+    if key != STICKER_GROUP:
         return
     _poll_her_sends()
     now = time.time()
@@ -4213,7 +3875,7 @@ def _flush_due():
         try:
             _process_batch(key, scene, items)
         except Exception as e:
-            print(f"[debounce] process error {key}: {e}", flush=True)
+            print(f"[debounce] process error: {type(e).__name__}", flush=True)
 
 def _flusher():
     while True:
@@ -4353,7 +4015,7 @@ def _record_decision(d, actual_raw, extra=None):
 # a small JSON file so a bridge restart does not reset it - same shape
 # as the night @ cooldown above. Only actual fires are booked;
 # suppressed hits are logged as BOTKEY_COOLDOWN and change nothing.
-BOTKEY_KEYS = {"grp-81658512", "dm-1480760876", "dm-1689332102"}
+BOTKEY_KEYS = frozenset(ROUTES)
 BOTKEY_CD_S = 120.0
 BOTKEY_CD_FILE = BRIDGE_DIR / "botkey-cooldown.json"
 _BK_CD = {}
@@ -4531,42 +4193,36 @@ def _process_batch(key, scene, items):
     if _bk:
         if botkey_in_cooldown(key):
             _record_decision(_dec, "BOTKEY_COOLDOWN")
-            with open(DRAFTS_LOG, "a") as f:
-                f.write(json.dumps({"ts": time.time(), "key": key, "peer": peer,
+            _record_draft({"ts": time.time(), "key": key, "peer": peer,
                                     "tx": txs, "incoming": combined[:400],
                                     "decision": "BOTKEY_COOLDOWN",
-                                    "botkey": _bk, "batch": len(items)},
-                                   ensure_ascii=False) + "\n")
+                                    "botkey": _bk, "batch": len(items)})
             return
-        botkey_note_fire(key)
-        botkey_note_sent(key, botkey_rule.BOTKEY_TEXT)
-        _record_decision(_dec, "REPLY")
-        with open(DRAFTS_LOG, "a") as f:
-            f.write(json.dumps({"ts": time.time(), "key": key, "peer": peer,
+        _record_draft({"ts": time.time(), "key": key, "peer": peer,
                                 "tx": txs, "incoming": combined[:400],
                                 "reply_to": None, "quote": False,
                                 "origin": "botkey", "botkey": _bk,
                                 "batch": len(items), "decision": "REPLY",
                                 "batch_id": _gate_batch_id,
                                 "batch_primary": _gate_primary,
-                                "draft_text": botkey_rule.BOTKEY_TEXT},
-                               ensure_ascii=False) + "\n")
+                                "draft_text": botkey_rule.BOTKEY_TEXT})
+        botkey_note_fire(key)
+        botkey_note_sent(key, botkey_rule.BOTKEY_TEXT)
+        _record_decision(_dec, "REPLY")
         return
     if key.startswith("grp-") and peak_quiet_active() and not batch_at_me(combined):
         _record_decision(_dec, "PEAK_QUIET")
-        with open(DRAFTS_LOG, "a") as f:
-            f.write(json.dumps({"ts": time.time(), "key": key, "peer": peer, "tx": txs,
+        _record_draft({"ts": time.time(), "key": key, "peer": peer, "tx": txs,
                                 "incoming": combined[:400], "decision": "PEAK_QUIET",
-                                "batch": len(items)}, ensure_ascii=False) + "\n")
+                                "batch": len(items)})
         return
     # Night mode (2026-10-26): 00:00-07:00, group batches that do not
     # call her are not drafted at all - she is asleep. Zero model calls.
     if key.startswith("grp-") and night_active() and not called:
         _record_decision(_dec, "NIGHT_QUIET")
-        with open(DRAFTS_LOG, "a") as f:
-            f.write(json.dumps({"ts": time.time(), "key": key, "peer": peer, "tx": txs,
+        _record_draft({"ts": time.time(), "key": key, "peer": peer, "tx": txs,
                                 "incoming": combined[:400], "decision": "NIGHT_QUIET",
-                                "batch": len(items)}, ensure_ascii=False) + "\n")
+                                "batch": len(items)})
         return
     # Night @ anti-abuse cooldown (2026-10-28): at night, a caller whose
     # rolling 30 min counts have both hit 10 (call batches and her
@@ -4577,25 +4233,23 @@ def _process_batch(key, scene, items):
         _cd = at_cd_gate(key, items)
         if _cd:
             _record_decision(_dec, "NIGHT_AT_COOLDOWN")
-            with open(DRAFTS_LOG, "a") as f:
-                f.write(json.dumps({"ts": time.time(), "key": key, "peer": peer, "tx": txs,
+            _record_draft({"ts": time.time(), "key": key, "peer": peer, "tx": txs,
                                     "incoming": combined[:400], "decision": "NIGHT_AT_COOLDOWN",
-                                    "batch": len(items), "at_cooldown": _cd}, ensure_ascii=False) + "\n")
+                                    "batch": len(items), "at_cooldown": _cd})
             return
 
     if key.startswith("grp-") and get_retreat(key) and not called:
         _record_decision(_dec, "RETREAT")
-        with open(DRAFTS_LOG, "a") as f:
-            f.write(json.dumps({"ts": time.time(), "key": key, "peer": peer, "tx": txs,
+        _record_draft({"ts": time.time(), "key": key, "peer": peer, "tx": txs,
                                 "incoming": combined[:400], "decision": "RETREAT",
-                                "batch": len(items)}, ensure_ascii=False) + "\n")
+                                "batch": len(items)})
         return
     with conv_lock(key):
         # Cross-process lock: the heartbeat daemon shares the group DSH
         # session; never run two DSH calls on one session at once.
         # A brand-new contact has no directory yet; the lock open below
         # would raise FileNotFoundError and silently kill the batch
-        # (this is why dm-1689332102 never got a reply). Create it first.
+        # Create the conversation directory first.
         (CONTACTS / key).mkdir(parents=True, exist_ok=True)
         with open(CONTACTS / key / "dsh.lock", "a") as lf:
             fcntl.flock(lf, fcntl.LOCK_EX)
@@ -4603,8 +4257,8 @@ def _process_batch(key, scene, items):
                 # A04（2026-10-27 审计）：发送归属在源头打标——桥最
                 # 清楚这一稿是哪条路径产的，sender 只透传/兜底推导。
                 origin = "autonomous"
-                res = try_persona_command(combined) if key == "dm-1480760876" else None
-                if res is None and key == "dm-1480760876":
+                res = try_persona_command(combined) if key == MASTER_DM else None
+                if res is None and key == MASTER_DM:
                     res = try_proactive_command(combined)
                 if res is not None:
                     origin = "command"
@@ -4765,8 +4419,7 @@ def _process_batch(key, scene, items):
                     res["draft_text"] = ""
                     res["close_class"] = "SAFETY_WITHHOLD/DET_GATE"
                     _record_withhold(key, res, _gate_batch_id)
-    with open(DRAFTS_LOG, "a") as f:
-        f.write(json.dumps({"ts": time.time(), "key": key, "peer": peer, "tx": txs,
+    _record_draft({"ts": time.time(), "key": key, "peer": peer, "tx": txs,
                             "incoming": combined[:400],
                             "reply_to": last["message_id"] if quote else None,
                             "quote": quote, "bg_chars": len(bg_text),
@@ -4774,7 +4427,7 @@ def _process_batch(key, scene, items):
                             "bg_summary": _bg_summaries(bg_text),
                             "origin": origin,
                             "meme_hits": _MEME_LAST_STATS["hits"], "meme_chars": _MEME_LAST_STATS["chars"],
-                            "batch": len(items), **res}, ensure_ascii=False) + "\n")
+                            "batch": len(items), **res})
     _record_decision(_dec, (res or {}).get("decision"))
     # Drives bookkeeping (2026-10-26, best-effort): being explicitly
     # @-ed in the group lifts her social drive a little ("mentioned");
@@ -4923,19 +4576,41 @@ RECOVERY_MAX_EVENTS = 100
 RECOVERY_MAX_ATTEMPTS = 3
 RECOVERY_SCAN_BYTES = 4 * 1024 * 1024
 
+DRAFT_COMPLETIONS = QQ_DIR / "private-state" / "draft-completions.jsonl"
+
+
+def _record_draft(row):
+    tx = row.get("tx")
+    if row.get("decision") == "REPLY":
+        record = {name: row[name] for name in ("key", "decision", "draft_text",
+                  "reply_to", "quote", "batch_primary", "tx", "origin") if name in row}
+        record["version"] = 1
+        serialized = json.dumps(record, sort_keys=True, ensure_ascii=False).encode()
+        record["record_id"] = hashlib.sha256(serialized).hexdigest()
+        publish(record)
+    DRAFT_COMPLETIONS.parent.mkdir(mode=0o700, exist_ok=True)
+    with open(DRAFT_COMPLETIONS, "a", encoding="utf-8") as stream:
+        stream.write(json.dumps({"tx": tx}) + "\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+    with open(DRAFTS_LOG, "a", encoding="utf-8") as stream:
+        stream.write(json.dumps({"ts": row.get("ts"), "tx": tx,
+                                 "decision": row.get("decision")}) + "\n")
+
+
 def _draft_tx_set():
-    """drafts.jsonl 里出现过的全部 tx（标量/列表两种写法通吃）。"""
     done = set()
-    for raw in _tail_lines(DRAFTS_LOG, RECOVERY_SCAN_BYTES):
+    for raw in _tail_lines(DRAFT_COMPLETIONS, RECOVERY_SCAN_BYTES):
         try:
             tx = json.loads(raw).get("tx")
-        except Exception:
+        except (ValueError, AttributeError):
             continue
         if isinstance(tx, str) and tx:
             done.add(tx)
         elif isinstance(tx, list):
             done.update(t for t in tx if isinstance(t, str) and t)
     return done
+
 
 def _recovery_attempts():
     """recovery.jsonl 里每个 tx 已补处理过的次数。"""
@@ -4979,7 +4654,7 @@ def _recover_unprocessed():
             if isinstance(ets, (int, float)) and ets and \
                     now - float(ets) > RECOVERY_WINDOW_SEC:
                 continue    # 窗外老事件不补，防把陈年旧账翻出来重处理
-            if tx in done:
+            if tx in done or (in_scope(ev) and handed_off(_ev_sess(ev), tx)):
                 continue
             if attempts.get(tx, 0) >= RECOVERY_MAX_ATTEMPTS:
                 continue    # 补满 3 次仍无记录：止损，不再反复补
@@ -5005,7 +4680,11 @@ def _recover_unprocessed():
             except Exception:
                 pass
     except Exception as e:
-        print(f"[recovery] scan failed: {e}", flush=True)
+        print(f"[recovery] scan failed: {type(e).__name__}", flush=True)
+
+def in_scope(ev):
+    return ev.get("post_type") == "message" and _ev_sess(ev) in ROUTES
+
 
 def _persist_event(ev):
     """事件先落盘。返回 'ok' / 'dup' / 'fail'。'fail' 时绝不可回 200。
@@ -5018,6 +4697,8 @@ def _persist_event(ev):
     fail。单条 append+fsync 在锁内串行化是毫秒级代价，换来指纹账与
     文件严格一致。_ack_flush 仍在解锁后调用（它自带 ACK_LOCK）。"""
     global _ACK_DIRTY
+    if not in_scope(ev):
+        return "ignored"
     if not ev.get("tx"):
         ev["tx"] = _new_txid()   # 第 2 批：事务 ID 在落盘源头生成、随记录行走
     fp = _ev_fp(ev)
@@ -5031,7 +4712,8 @@ def _persist_event(ev):
         else:
             _ACK_SEEN[fp] = time.time()      # 先占位，后写盘
             try:
-                with open(EVENTS_LOG, "a") as f:
+                EVENTS_LOG.parent.mkdir(mode=0o700, exist_ok=True)
+                with open(EVENTS_LOG, "a", encoding="utf-8") as f:
                     f.write(line)
                     f.flush()
                     os.fsync(f.fileno())
@@ -5047,7 +4729,7 @@ def _persist_event(ev):
                 outcome = "fail"
                 err = e
     if outcome == "fail":
-        print(f"[ack] events.jsonl write failed: {err}", flush=True)
+        print(f"[ack] persistence failed: {type(err).__name__}", flush=True)
         _ack_flush(force=True)
     elif outcome == "dup":
         _ack_flush(force=True)
@@ -5057,14 +4739,16 @@ def _persist_event(ev):
 
 def handle_event(ev, logged=False):
     global SELF_ID
+    if not in_scope(ev):
+        return
     if ev.get("self_id") and SELF_ID is None: SELF_ID = ev["self_id"]
     if not logged:
         # 防御：非 HTTP 线程的调用方也走同一条落盘路
-        if _persist_event(ev) == "fail":
+        if _persist_event(ev) != "ok":
             return
     if ev.get("post_type") != "message":
         return
-    if ev.get("user_id") == ev.get("self_id"):
+    if str(ev.get("user_id")) == str(ev.get("self_id")):
         _qidx_index_event(ev)
         _ridx_put(_ev_key(ev), ev.get("message_id"), ev.get("time"),
                   _ev_author(ev), seg_text(ev.get("message")))
@@ -5087,25 +4771,9 @@ def handle_event(ev, logged=False):
         key = f"grp-{ev['group_id']}"; scene = f"群聊（群号 {ev['group_id']}）"
     else:
         return
-    # Scope (user, 2026-10-24): Xiaomei only attends to these conversations.
-    # Everything else is logged in events.jsonl but never drafted.
-    ALLOWED_DM = {"1480760876", "1689332102"}   # 草莓奶昔 (user) / 仲宥
-    ALLOWED_GROUPS = {"81658512"}              # 秋秋祈祷室～直播家人群
-    in_scope = (str(ev["user_id"]) in ALLOWED_DM) if mtype == "private" \
-        else (str(ev["group_id"]) in ALLOWED_GROUPS)
-    if not in_scope:
-        with open(DRAFTS_LOG, "a") as f:
-            f.write(json.dumps({"ts": time.time(), "key": key, "tx": ev.get("tx"),
-                                "decision": "OUT_OF_SCOPE", "incoming": text},
-                               ensure_ascii=False) + "\n")
-        return
-    if key == "grp-81658512":
-        collect_stickers(ev)
     if KILLSWITCH.exists():
-        with open(DRAFTS_LOG, "a") as f:
-            f.write(json.dumps({"ts": time.time(), "key": key, "tx": ev.get("tx"),
-                                "decision": "KILLSWITCH_ON", "incoming": text},
-                               ensure_ascii=False) + "\n")
+        _record_draft({"ts": time.time(), "key": key, "tx": ev.get("tx"),
+                                "decision": "KILLSWITCH_ON", "incoming": text})
         return
     text = recognize_images(ev, text)
     text = recognize_audio(ev, text)
@@ -5129,66 +4797,245 @@ def handle_event(ev, logged=False):
     # (quote prefix + image/audio recognition already applied).
     _ridx_put(key, ev.get("message_id"), ev.get("time") or time.time(), name, text)
 
+class RequestRejected(Exception):
+    pass
+
+
+def valid_event(ev):
+    if not isinstance(ev, dict) or not isinstance(ev.get("post_type"), str):
+        return False
+    if ev["post_type"] != "message":
+        return ev["post_type"] in {"meta_event", "notice", "request"}
+    if ev.get("message_type") not in ("private", "group"):
+        return False
+    fields = ["self_id", "user_id", "message_id", "time"]
+    if ev["message_type"] == "group":
+        fields.append("group_id")
+    if any(type(ev.get(field)) not in (str, int)
+           or not re.fullmatch(r"-?[0-9]{1,20}", str(ev[field])) for field in fields):
+        return False
+    if any(int(ev[field]) <= 0 for field in fields if field != "message_id"):
+        return False
+    sender = ev.get("sender")
+    if not isinstance(sender, dict) or any(
+        not isinstance(sender[field], str) or len(sender[field]) > 256
+        for field in ("nickname", "card") if field in sender
+    ):
+        return False
+    message = ev.get("message")
+    if isinstance(message, str):
+        return len(message) <= 65536
+    if not isinstance(message, list) or len(message) > 256:
+        return False
+    for segment in message:
+        if not isinstance(segment, dict) or not isinstance(segment.get("type"), str):
+            return False
+        data = segment.get("data")
+        if len(segment["type"]) > 64 or not isinstance(data, dict) or len(data) > 64:
+            return False
+        if any(len(field) > 64 or type(value) not in (str, int, bool, float)
+               or len(str(value)) > 65536 for field, value in data.items()):
+            return False
+    return True
+
+
+class BoundedServer(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def __init__(self, address, handler):
+        self.connections = threading.BoundedSemaphore(16)
+        self.capacity = threading.BoundedSemaphore(16)
+        self.events = queue.Queue(maxsize=16)
+        super().__init__(address, handler)
+        for _ in range(16):
+            threading.Thread(target=self._work, daemon=True).start()
+
+    def _work(self):
+        while True:
+            ev = self.events.get()
+            try:
+                handle_event(ev, logged=True)
+            except Exception as exc:
+                print(f"[webhook] processing failed: {type(exc).__name__}", flush=True)
+            finally:
+                self.capacity.release()
+                self.events.task_done()
+
+    def process_request(self, request, address):
+        if not self.connections.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        try:
+            request.settimeout(3)
+            super().process_request(request, address)
+        except BaseException:
+            self.connections.release()
+            raise
+
+    def process_request_thread(self, request, address):
+        try:
+            super().process_request_thread(request, address)
+        finally:
+            self.connections.release()
+
+
 class Handler(BaseHTTPRequestHandler):
-    def _read_body(self):
-        te = (self.headers.get("Transfer-Encoding", "") or "").lower()
-        if "chunked" in te:
-            out = b""
-            while True:
-                line = self.rfile.readline(65536).strip()
-                try: size = int(line.split(b";")[0], 16)
-                except Exception: break
-                if size == 0:
-                    while True:
-                        t = self.rfile.readline(65536)
-                        if t in (b"\r\n", b"\n", b""): break
-                    break
-                out += self.rfile.read(size)
-                self.rfile.readline(65536)
+    MAX_BODY = 1024 * 1024
+
+    def handle(self):
+        timer = threading.Timer(3, self._expire_headers)
+        timer.daemon = True
+        self.header_timer = timer
+        timer.start()
+        try:
+            super().handle()
+        finally:
+            timer.cancel()
+
+    def _expire_headers(self):
+        import socket
+
+        try:
+            self.connection.shutdown(socket.SHUT_RD)
+        except OSError:
+            pass
+
+    def parse_request(self):
+        try:
+            return super().parse_request()
+        finally:
+            self.header_timer.cancel()
+
+
+    def _read_body(self, digest):
+        deadline = time.monotonic() + 5
+
+        def read_exact(size):
+            out = bytearray()
+            while len(out) < size:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    raise RequestRejected(408)
+                self.connection.settimeout(min(2, left))
+                chunk = self.rfile.read1(min(size - len(out), 65536))
+                if not chunk:
+                    raise RequestRejected(400)
+                out.extend(chunk)
             return out
-        try: n = int(self.headers.get("Content-Length", "0") or "0")
-        except Exception: n = 0
-        return self.rfile.read(n) if n > 0 else b""
+
+        def read_frame_line():
+            line = bytearray()
+            while len(line) < 32:
+                line.extend(read_exact(1))
+                if line.endswith(b"\n"):
+                    if not line.endswith(b"\r\n"):
+                        break
+                    return line[:-2]
+            raise RequestRejected(400)
+
+        lengths = self.headers.get_all("Content-Length", [])
+        encodings = self.headers.get_all("Transfer-Encoding", [])
+        body = bytearray()
+
+        def append(size):
+            if len(body) + size > self.MAX_BODY:
+                raise RequestRejected(413)
+            chunk = read_exact(size)
+            if digest is not None:
+                digest.update(chunk)
+            body.extend(chunk)
+
+        if encodings:
+            if lengths or len(encodings) != 1 or encodings[0].strip().lower() != "chunked":
+                raise RequestRejected(400)
+            for count in range(4097):
+                line = read_frame_line()
+                if not re.fullmatch(rb"[0-9a-fA-F]{1,16}", line):
+                    raise RequestRejected(400)
+                size = int(line, 16)
+                if not size:
+                    if read_frame_line():
+                        raise RequestRejected(400)
+                    return body
+                if count == 4096:
+                    raise RequestRejected(413)
+                append(size)
+                if read_exact(2) != b"\r\n":
+                    raise RequestRejected(400)
+        if len(lengths) != 1 or not re.fullmatch(r"[0-9]{1,20}", lengths[0]):
+            raise RequestRejected(400)
+        append(int(lengths[0]))
+        return body
 
     def do_POST(self):
+        self.close_connection = True
         if self.path != "/onebot":
-            self.send_response(404); self.end_headers(); return
-        raw = self._read_body()
-        # OneBot 11 auth: either Authorization: Bearer <token>, or the
-        # X-Signature header (sha1 HMAC of the raw body, keyed with the
-        # token) which is what NapCat actually sends on event posts.
-        auth = self.headers.get("Authorization", "")
-        ok = (auth == f"Bearer {TOKEN}")
-        sig = self.headers.get("X-Signature", "") or ""
-        if not ok and sig.startswith("sha1="):
-            import hashlib, hmac
-            calc = hmac.new(TOKEN.encode(), raw, hashlib.sha1).hexdigest()
-            ok = hmac.compare_digest(calc, sig[5:])
-        if not ok:
-            self.send_response(403); self.end_headers(); return
-        try:
-            ev = json.loads(raw or b"{}")
-        except Exception:
-            self.send_response(400); self.end_headers(); return
-        # B-04: 落盘成功才 ACK；失败回 500 让上游重试；重复上报只 ACK 不起稿。
-        status = _persist_event(ev)
-        if status == "fail":
-            self.send_response(500)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(b'{"ok": false, "persisted": false}')
+            self.send_error(404)
             return
+        auth = self.headers.get_all("Authorization", [])
+        sig = self.headers.get_all("X-Signature", [])
+        bearer = len(auth) == 1 and hmac.compare_digest(
+            auth[0].encode("latin-1"), b"Bearer " + WEBHOOK_SECRET.encode("ascii"))
+        if not bearer and not (len(sig) == 1 and re.fullmatch(r"sha1=[a-fA-F0-9]{40}", sig[0])):
+            self.send_error(403)
+            return
+        digest = None if bearer else hmac.new(WEBHOOK_SECRET.encode(), digestmod="sha1")
+        try:
+            raw = self._read_body(digest)
+            if digest is not None and not hmac.compare_digest(digest.hexdigest(), sig[0][5:].lower()):
+                raise RequestRejected(403)
+            ev = json.loads(raw.decode("utf-8"), parse_constant=self._reject_constant)
+            if not valid_event(ev):
+                raise RequestRejected(400)
+        except RequestRejected as exc:
+            self.send_error(exc.args[0])
+            return
+        except TimeoutError:
+            self.send_error(408)
+            return
+        except (ValueError, RecursionError):
+            self.send_error(400)
+            return
+        if ev["post_type"] == "message":
+            ev["time"] = int(ev["time"])
+        if in_scope(ev):
+            ev.pop("tx", None)
+            if not self.server.capacity.acquire(blocking=False):
+                self.send_error(503)
+                return
+            handed_off = False
+            try:
+                status = _persist_event(ev)
+                if status == "fail":
+                    self.send_error(500)
+                    return
+                if status == "ok":
+                    self.server.events.put_nowait(ev)
+                    handed_off = True
+            finally:
+                if not handed_off:
+                    self.server.capacity.release()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", "2")
         self.end_headers()
         self.wfile.write(b"{}")
-        if status == "ok":
-            threading.Thread(target=handle_event, args=(ev,),
-                             kwargs={"logged": True}, daemon=True).start()
-    def log_message(self, *a):
+
+    @staticmethod
+    def _reject_constant(value):
+        raise ValueError("Non-JSON number")
+
+    def log_message(self, *args):
         pass
 
+
 if __name__ == "__main__":
+    os.umask(0o077)
+    WEBHOOK_SECRET = credential("YOU_WEBHOOK_SECRET")
+    TOKEN = credential("YOU_ONEBOT_TOKEN")
+    API_KEY = credential("YOU_DSH_KEY")
+    if WEBHOOK_SECRET == TOKEN or API_KEY in (TOKEN, WEBHOOK_SECRET):
+        raise RuntimeError("Bridge credentials must be distinct")
     CONTACTS.mkdir(parents=True, exist_ok=True)
     _ack_warm()
     # R-02：启动补处理（独立线程）——扫「有 tx 的事件 − 已处理集合」，
@@ -5196,4 +5043,4 @@ if __name__ == "__main__":
     threading.Thread(target=_recover_unprocessed, daemon=True).start()
     threading.Thread(target=_flusher, daemon=True).start()
     print("bridge listening on 127.0.0.1:3010 (debounce + retreat on)", flush=True)
-    ThreadingHTTPServer(("127.0.0.1", 3010), Handler).serve_forever()
+    BoundedServer(("127.0.0.1", 3010), Handler).serve_forever()

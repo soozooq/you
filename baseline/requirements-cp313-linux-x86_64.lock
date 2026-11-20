@@ -1,0 +1,3 @@
+# Candidate wheels for CPython 3.13 on Linux x86-64.
+PyYAML==6.0.3 --hash=sha256:0f29edc409a6392443abf94b9cf89ce99889a1dd5376d94316ae5145dfedd5d6
+Pillow==13.0.0 --hash=sha256:5f56499c1a74d2b862beb0c33b8016f99d095858455df9d21583bbbc1c15b582
